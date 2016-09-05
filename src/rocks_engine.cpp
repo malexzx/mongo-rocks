@@ -133,10 +133,29 @@ namespace mongo {
 
         class PrefixDeletingCompactionFilter : public rocksdb::CompactionFilter {
         public:
-            explicit PrefixDeletingCompactionFilter(std::unordered_set<uint32_t> droppedPrefixes)
+            explicit PrefixDeletingCompactionFilter(std::unordered_set<uint32_t> droppedPrefixes, std::unordered_set<uint32_t> collectionPrefixes)
                 : _droppedPrefixes(std::move(droppedPrefixes)),
                   _prefixCache(0),
-                  _droppedCache(false) {}
+                  _droppedCache(false),
+                  _collectionPrefixes(std::move(collectionPrefixes)),
+                  _collectionPrefixCache(0),
+                  _collectionCache(false)
+
+
+            {}
+            bool HasExpired(const rocksdb::Slice& /* key */, const rocksdb::Slice& value) const {
+                if (value.size() == 0) return false;
+                BSONObj data(value.data());
+                BSONElement element = data.getField("_rttl");
+
+                if (element.eoo() || !element.isNumber()) {
+                    return false;
+                }
+
+                uint64_t myttl = static_cast<uint64_t>(element.numberLong());
+                bool expired = myttl < (uint64_t) time(NULL);
+                return expired;
+            }
 
             // filter is not called from multiple threads simultaneously
             virtual bool Filter(int level, const rocksdb::Slice& key,
@@ -149,12 +168,22 @@ namespace mongo {
                     // filter's job to report corruption, so we just silently continue
                     return false;
                 }
-                if (prefix == _prefixCache) {
-                    return _droppedCache;
+                if (_droppedCache && prefix == _prefixCache) {
+                    return true;
                 }
-                _prefixCache = prefix;
-                _droppedCache = _droppedPrefixes.find(prefix) != _droppedPrefixes.end();
-                return _droppedCache;
+                if (prefix != _prefixCache) {
+                    _prefixCache = prefix;
+                    _droppedCache = _droppedPrefixes.find(prefix) != _droppedPrefixes.end();
+                    if(_droppedCache)
+                      return _droppedCache;
+                }
+                //_droppedCache is false, continue with value
+                if (_collectionCache && prefix == _collectionPrefixCache) {
+                    return HasExpired(key, existing_value);
+                }
+                _collectionPrefixCache = prefix;
+                _collectionCache = _collectionPrefixes.find(prefix) != _collectionPrefixes.end();
+                return _collectionCache ? HasExpired(key, existing_value) : false;
             }
 
             virtual const char* Name() const { return "PrefixDeletingCompactionFilter"; }
@@ -163,6 +192,9 @@ namespace mongo {
             std::unordered_set<uint32_t> _droppedPrefixes;
             mutable uint32_t _prefixCache;
             mutable bool _droppedCache;
+            std::unordered_set<uint32_t> _collectionPrefixes;
+            mutable uint32_t _collectionPrefixCache;
+            mutable bool _collectionCache;
         };
 
         class PrefixDeletingCompactionFilterFactory : public rocksdb::CompactionFilterFactory {
@@ -173,13 +205,9 @@ namespace mongo {
             virtual std::unique_ptr<rocksdb::CompactionFilter> CreateCompactionFilter(
                 const rocksdb::CompactionFilter::Context& context) override {
                 auto droppedPrefixes = _engine->getDroppedPrefixes();
-                if (droppedPrefixes.size() == 0) {
-                    // no compaction filter needed
-                    return std::unique_ptr<rocksdb::CompactionFilter>(nullptr);
-                } else {
+                auto collectionPrefixes = _engine->getCollectionPrefixes();
                     return std::unique_ptr<rocksdb::CompactionFilter>(
-                        new PrefixDeletingCompactionFilter(std::move(droppedPrefixes)));
-                }
+                        new PrefixDeletingCompactionFilter(std::move(droppedPrefixes), std::move(collectionPrefixes)));
             }
 
             virtual const char* Name() const override {
@@ -533,6 +561,16 @@ namespace mongo {
         return _droppedPrefixes;
     }
 
+    std::unordered_set<uint32_t> RocksEngine::getCollectionPrefixes() const {
+        stdx::lock_guard<stdx::mutex> lk(_identPrefixMapMutex);
+        std::unordered_set<uint32_t> prefixes;
+        for (auto& entry : _identPrefixMap) {
+            if(!memcmp(entry.first.c_str(), "collection", 10)) {
+               prefixes.insert(entry.second);
+            }
+        }
+        return prefixes;
+    }
     // non public api
     Status RocksEngine::_createIdentPrefix(StringData ident) {
         uint32_t prefix = 0;
