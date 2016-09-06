@@ -149,6 +149,7 @@ namespace mongo {
         size_t getBlockCacheUsage() const { return _block_cache->GetUsage(); }
         std::shared_ptr<rocksdb::Cache> getBlockCache() { return _block_cache; }
         std::unordered_set<uint32_t> getDroppedPrefixes() const;
+        std::unordered_set<uint32_t> getCollectionPrefixes() const;
 
         RocksTransactionEngine* getTransactionEngine() { return &_transactionEngine; }
 
@@ -212,6 +213,7 @@ namespace mongo {
 
         static const std::string kMetadataPrefix;
         static const std::string kDroppedPrefix;
+        static const std::string kCollectionPrefix;
 
         std::unique_ptr<RocksDurabilityManager> _durabilityManager;
         class RocksJournalFlusher;
