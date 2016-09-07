@@ -59,6 +59,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/storage/journal_listener.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/platform/endian.h"
 #include "mongo/util/background.h"
 #include "mongo/util/log.h"
@@ -132,17 +133,24 @@ namespace mongo {
 
         class PrefixDeletingCompactionFilter : public rocksdb::CompactionFilter {
         public:
-            explicit PrefixDeletingCompactionFilter(rocksdb::Env* env, std::unordered_set<uint32_t> droppedPrefixes,
-                                                    std::unordered_set<uint32_t> collectionPrefixes)
-                : _env(env),
+            explicit PrefixDeletingCompactionFilter(const RocksEngine* engine, std::unordered_set<uint32_t> droppedPrefixes,
+                                                    RocksEngine::CollectionsChangeParam collectionPrefixes)
+                : _engine(engine),
                   _droppedPrefixes(std::move(droppedPrefixes)),
                   _prefixCache(0),
                   _droppedCache(false),
-                  _collectionPrefixes(std::move(collectionPrefixes)),
+                  _collectionParams(std::move(collectionPrefixes)),
                   _collectionPrefixCache(0),
                   _collectionCache(false)
             {}
-            bool HasExpired(const rocksdb::Slice& /* key */, const rocksdb::Slice& value) const {
+            ~PrefixDeletingCompactionFilter(){
+                for(auto &el: _collectionParams) {
+                    log() << el.second.first << " ~ XXX prefix=" << el.first << " size=" << el.second.second.dataSize << " num=" << el.second.second.numRecords;
+                }
+                RocksEngine *engine = const_cast<RocksEngine *>(_engine);
+                engine->UpdateCollectionParamsTTL(_collectionParams);
+            }
+            bool HasExpired(const rocksdb::Slice& value, RocksEngine::RecordStoreChange *el) const {
                 if (value.size() == 0) return false;
                 BSONObj data(value.data());
                 BSONElement element = data.getField("_rttl");
@@ -153,10 +161,14 @@ namespace mongo {
 
                 int64_t rttl = static_cast<int64_t>(element.numberLong());
                 int64_t curtime;
-                if (!_env->GetCurrentTime(&curtime).ok()) {
+                if (!_engine->getDB()->GetEnv()->GetCurrentTime(&curtime).ok()) {
                    return false;  // Treat the data as fresh if could not get current time
                 }
                 bool expired = rttl < curtime;
+                if (expired) {
+                  el->dataSize += data.objsize();
+                  el->numRecords += 1;
+                }
                 return expired;
             }
 
@@ -185,23 +197,32 @@ namespace mongo {
                 }
                 //_droppedCache is false, continue with value
                 if (_collectionCache && prefix == _collectionPrefixCache) {
-                    return HasExpired(key, existing_value);
+                    return HasExpired(existing_value, &_recordChangeCache);
+                }
+                // store previos result, if cached
+                if (_collectionCache) {
+                   auto it = _collectionParams.find(_collectionPrefixCache);
+                   invariant(it != _collectionParams.end());
+                   it->second.second = _recordChangeCache;
+                   _recordChangeCache.clear();
                 }
                 _collectionPrefixCache = prefix;
-                _collectionCache = _collectionPrefixes.find(prefix) != _collectionPrefixes.end();
-                return _collectionCache ? HasExpired(key, existing_value) : false;
+                auto it = _collectionParams.find(prefix);
+                _collectionCache = it != _collectionParams.end();
+                return _collectionCache ? HasExpired(existing_value, &_recordChangeCache) : false;
             }
 
             virtual const char* Name() const { return "PrefixDeletingCompactionFilter"; }
 
         private:
-            rocksdb::Env* _env;
+            const RocksEngine* _engine;
             std::unordered_set<uint32_t> _droppedPrefixes;
             mutable uint32_t _prefixCache;
             mutable bool _droppedCache;
-            std::unordered_set<uint32_t> _collectionPrefixes;
+            mutable RocksEngine::CollectionsChangeParam _collectionParams;
             mutable uint32_t _collectionPrefixCache;
             mutable bool _collectionCache;
+            mutable RocksEngine::RecordStoreChange _recordChangeCache;
         };
 
         class PrefixDeletingCompactionFilterFactory : public rocksdb::CompactionFilterFactory {
@@ -214,7 +235,7 @@ namespace mongo {
                 auto droppedPrefixes = _engine->getDroppedPrefixes();
                 auto collectionPrefixes = _engine->getCollectionPrefixes();
                     return std::unique_ptr<rocksdb::CompactionFilter>(
-                        new PrefixDeletingCompactionFilter(_engine->getDB()->GetEnv(), std::move(droppedPrefixes), std::move(collectionPrefixes)));
+                        new PrefixDeletingCompactionFilter(_engine, std::move(droppedPrefixes), std::move(collectionPrefixes)));
             }
 
             virtual const char* Name() const override {
@@ -298,10 +319,11 @@ namespace mongo {
                     invariant(false);
                 }
                 uint32_t identPrefix = static_cast<uint32_t>(element.numberInt());
-
-                _identMap[StringData(ident.data(), ident.size())] =
-                    std::move(identConfig.getOwned());
-
+#ifdef __APPLE__
+                _identMap[StringData(ident.data(), ident.size())]  = identConfig.getOwned();
+#else
+                _identMap[StringData(ident.data(), ident.size())]  = std::move(identConfig.getOwned());
+#endif
                 _maxPrefix = std::max(_maxPrefix, identPrefix);
             }
         }
@@ -584,9 +606,9 @@ namespace mongo {
         return _droppedPrefixes;
     }
 
-    std::unordered_set<uint32_t> RocksEngine::getCollectionPrefixes() const {
+    RocksEngine::CollectionsChangeParam RocksEngine::getCollectionPrefixes() const {
         stdx::lock_guard<stdx::mutex> lk(_identMapMutex);
-        std::unordered_set<uint32_t> prefixes;
+        RocksEngine::CollectionsChangeParam prefixes;
         for (auto& entry : _identMap) {
             rocksdb::Slice key(entry.first.c_str(), entry.first.size());
             if (key.starts_with(kCollectionPrefix)) {
@@ -596,10 +618,29 @@ namespace mongo {
                     invariant(false);
                 }
                 uint32_t identPrefix = static_cast<uint32_t>(element.numberInt());
-                prefixes.insert(identPrefix);
+                prefixes.emplace(std::make_pair(identPrefix,
+                                                std::make_pair(entry.first, RecordStoreChange())));
             }
         }
         return prefixes;
+    }
+    void RocksEngine::UpdateCollectionParamsTTL(const CollectionsChangeParam &collectionParams) {
+      //Client::initThread("RocksTTL");
+      //AuthorizationSession::get(cc())->grantInternalAuthorization();
+      //ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+
+      // collectionParams is safe for access, method called on own copy.
+      for(auto &element: collectionParams) {
+        if (!element.second.second.numRecords)
+          continue;
+        stdx::lock_guard<stdx::mutex> lk(_identObjectMapMutex);
+        auto re = _identCollectionMap.find(element.second.first);
+        if (re != _identCollectionMap.end()) { //may be dropped in middle
+            re->second->adjustSizeAndNumTTL(/*txnPtr.get()*/ nullptr,
+                                            element.second.second.dataSize,
+                                            element.second.second.numRecords);
+        }
+      }
     }
 
     // non public api
@@ -615,8 +656,11 @@ namespace mongo {
 
             prefix = ++_maxPrefix;
             configBuilder->append("prefix", static_cast<int32_t>(prefix));
-
+#ifdef __APPLE__
+            config = configBuilder->obj();
+#else
             config = std::move(configBuilder->obj());
+#endif
             _identMap[ident] = config.copy();
         }
 

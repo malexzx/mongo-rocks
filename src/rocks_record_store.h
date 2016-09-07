@@ -187,6 +187,8 @@ namespace mongo {
 
         static rocksdb::Comparator* newRocksCollectionComparator();
 
+        void adjustSizeAndNumTTL(OperationContext *tnx, long long dataSize, long long numRecords);
+
     private:
         // we just need to expose _makePrefixedKey to RocksOplogKeyTracker
         friend class RocksOplogKeyTracker;

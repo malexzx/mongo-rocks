@@ -149,7 +149,18 @@ namespace mongo {
         size_t getBlockCacheUsage() const { return _block_cache->GetUsage(); }
         std::shared_ptr<rocksdb::Cache> getBlockCache() { return _block_cache; }
         std::unordered_set<uint32_t> getDroppedPrefixes() const;
-        std::unordered_set<uint32_t> getCollectionPrefixes() const;
+
+        struct RecordStoreChange {
+          RecordStoreChange():dataSize(0), numRecords(0){}
+          void clear() {
+            dataSize = numRecords = 0;
+          }
+          long long dataSize;
+          long long numRecords;
+        };
+        typedef unordered_map<uint32_t, std::pair<std::string, RecordStoreChange> > CollectionsChangeParam;
+        CollectionsChangeParam getCollectionPrefixes() const;
+        void UpdateCollectionParamsTTL(const CollectionsChangeParam& p);
 
         RocksTransactionEngine* getTransactionEngine() { return &_transactionEngine; }
 

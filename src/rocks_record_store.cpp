@@ -52,6 +52,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/oplog_hack.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/platform/endian.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
@@ -542,8 +543,30 @@ namespace mongo {
         return docsRemoved;
     }
 
+    void RocksRecordStore::adjustSizeAndNumTTL(OperationContext *tnx, long long dataSize, long long numRecords) {
+      // internal adjustment - not persistent
+      _dataSize.fetch_sub(dataSize);
+      _numRecords.fetch_sub(numRecords);
+
+      rocksdb::WriteBatch wb;
+      _counterManager->updateCounter(_numRecordsKey, _numRecords.load(), &wb);
+      _counterManager->updateCounter(_dataSizeKey, _dataSize.load(), &wb);
+      if (wb.Count() > 0) {
+          auto s = _db->Write(rocksdb::WriteOptions(), &wb);
+          invariantRocksOK(s);
+      }
+
+      log() << "adjust size=-" << dataSize << " num=-" << numRecords;
+      /* wont work
+      WriteUnitOfWork wu(tnx);
+      _increaseDataSize(tnx, -dataSize);
+      _changeNumRecords(tnx, -numRecords);
+      wu.commit();
+      */
+   }
+
     StatusWith<RecordId> RocksRecordStore::insertRecord( OperationContext* txn,
-                                                        const char* data,
+                                                         const char* data,
                                                         int len,
                                                         bool enforceQuota ) {
 
